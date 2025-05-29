@@ -26,5 +26,5 @@ It displays live **incoming (IN)** and **outgoing (OUT)** traffic in two separat
 
 1. **Clone the repo**
    ```bash
-   git clone https://github.com/yourusername/network-monitor.git
+   git clone https://github.com/vs1ng/network-monitor.git
    cd network-monitor
