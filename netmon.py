@@ -7,16 +7,53 @@ from rich.console import Console
 from collections import defaultdict
 import argparse
 import signal
+import subprocess
 import sys
 
 console = Console()
-seen_connections = defaultdict(int)  # (src_ip, dst_ip, src_port, dst_port, direction) -> count
+seen_connections = defaultdict(int)  # (src_ip, dst_ip, src_port, dst_port, direction, hostname) -> count
+hostname_cache = {}
 
 def resolve_hostname(ip):
+    if ip in hostname_cache:
+        return hostname_cache[ip]
+
+    # Try `host`
     try:
-        return socket.gethostbyaddr(ip)[0]
-    except socket.herror:
-        return "Unknown"
+        result = subprocess.run(['host', ip], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2)
+        if "domain name pointer" in result.stdout:
+            hostname = result.stdout.split("domain name pointer")[1].strip().strip('.')
+            hostname_cache[ip] = hostname
+            return hostname
+    except Exception:
+        pass
+
+    # Try `nslookup`
+    try:
+        result = subprocess.run(['nslookup', ip], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2)
+        for line in result.stdout.splitlines():
+            if "name =" in line:
+                hostname = line.split("name =")[1].strip().strip('.')
+                hostname_cache[ip] = hostname
+                return hostname
+    except Exception:
+        pass
+
+    # Try `nmap -sL`
+    try:
+        result = subprocess.run(['nmap', '-sL', ip], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3)
+        for line in result.stdout.splitlines():
+            if "Nmap scan report for" in line:
+                parts = line.split()
+                if len(parts) >= 5:
+                    hostname = parts[4].strip('()')
+                    hostname_cache[ip] = hostname
+                    return hostname
+    except Exception:
+        pass
+
+    hostname_cache[ip] = "Unknown"
+    return "Unknown"
 
 def is_private_ip(ip):
     return ip.startswith("192.") or ip.startswith("10.") or ip.startswith("172.")
@@ -32,7 +69,7 @@ def build_table():
     table.add_column("Host", style="green")
 
     for conn, count in seen_connections.items():
-        src_ip, dst_ip, src_port, dst_port, length, direction, host = conn
+        src_ip, dst_ip, src_port, dst_port, direction, host, length = conn
         src = f"{src_ip}:{src_port}"
         dst = f"{dst_ip}:{dst_port}"
         table.add_row(str(count), direction, src, "→", dst, str(length), host)
@@ -52,7 +89,7 @@ def process_packet(packet):
         remote_ip = dst_ip if direction == "OUT" else src_ip
         remote_host = resolve_hostname(remote_ip)
 
-        conn_key = (src_ip, dst_ip, src_port, dst_port, length, direction, remote_host)
+        conn_key = (src_ip, dst_ip, src_port, dst_port, direction, remote_host, length)
         seen_connections[conn_key] += 1
 
 def handle_exit(sig, frame):
@@ -62,8 +99,8 @@ def handle_exit(sig, frame):
 def main():
     signal.signal(signal.SIGINT, handle_exit)
 
-    parser = argparse.ArgumentParser(description="Network Traffic Monitor with Table")
-    parser.add_argument('--filter', help='BPF filter (e.g., "tcp", "udp")', default="")
+    parser = argparse.ArgumentParser(description="Network Traffic Monitor with Hostnames")
+    parser.add_argument('--filter', help='BPF filter (e.g., \"tcp\", \"udp\")', default="")
     args = parser.parse_args()
 
     console.print("[bold yellow]Starting network monitor... Press Ctrl+C to stop[/bold yellow]")
