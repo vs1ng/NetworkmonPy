@@ -1,116 +1,128 @@
-#!/usr/bin/env python3
-from scapy.all import sniff, IP, TCP, UDP
 import socket
+import subprocess
+import threading
+import time
+from collections import defaultdict
+from scapy.all import sniff, IP
 from rich.live import Live
 from rich.table import Table
-from rich.console import Console
-from collections import defaultdict
-import argparse
-import signal
-import subprocess
-import sys
+from rich.text import Text
+from rich.console import Group
+import requests
+import psutil
 
-console = Console()
-seen_connections = defaultdict(int)  # (src_ip, dst_ip, src_port, dst_port, direction, hostname) -> count
+seen_in_connections = defaultdict(int)
+seen_out_connections = defaultdict(int)
 hostname_cache = {}
+country_cache = {}
+
+def get_all_local_ips():
+    local_ips = set()
+    for iface_addrs in psutil.net_if_addrs().values():
+        for addr in iface_addrs:
+            if addr.family.name == 'AF_INET':
+                local_ips.add(addr.address)
+    local_ips.add("127.0.0.1")
+    return local_ips
+
+all_local_ips = get_all_local_ips()
 
 def resolve_hostname(ip):
     if ip in hostname_cache:
         return hostname_cache[ip]
-
-    # Try `host`
     try:
-        result = subprocess.run(['host', ip], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2)
-        if "domain name pointer" in result.stdout:
-            hostname = result.stdout.split("domain name pointer")[1].strip().strip('.')
-            hostname_cache[ip] = hostname
-            return hostname
-    except Exception:
-        pass
+        host = socket.gethostbyaddr(ip)[0]
+        hostname_cache[ip] = host
+        return host
+    except:
+        hostname_cache[ip] = "-"
+        return "-"
 
-    # Try `nslookup`
+def get_country_flag(ip):
+    if ip in country_cache:
+        return country_cache[ip]
     try:
-        result = subprocess.run(['nslookup', ip], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2)
-        for line in result.stdout.splitlines():
-            if "name =" in line:
-                hostname = line.split("name =")[1].strip().strip('.')
-                hostname_cache[ip] = hostname
-                return hostname
-    except Exception:
-        pass
+        response = requests.get(f"https://ipapi.co/{ip}/json/", timeout=1.5)
+        data = response.json()
+        cc = data.get("country_code", "")
+        flag = ''.join([chr(ord(c) + 127397) for c in cc]) if cc else ""
+        result = f"{flag} {data.get('country_name', 'Unknown')}"
+        country_cache[ip] = result
+        return result
+    except:
+        country_cache[ip] = "Unknown"
+        return "Unknown"
 
-    # Try `nmap -sL`
-    try:
-        result = subprocess.run(['nmap', '-sL', ip], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3)
-        for line in result.stdout.splitlines():
-            if "Nmap scan report for" in line:
-                parts = line.split()
-                if len(parts) >= 5:
-                    hostname = parts[4].strip('()')
-                    hostname_cache[ip] = hostname
-                    return hostname
-    except Exception:
-        pass
+def is_suspicious_domain(domain):
+    domain = domain.lower()
+    if any(word in domain for word in ['login', 'secure', 'verify', 'update', 'account']):
+        return True
+    if domain.count('.') > 3 or domain.count('-') > 2:
+        return True
+    return False
 
-    hostname_cache[ip] = "Unknown"
-    return "Unknown"
+def propose_host_name(host):
+    if not host or host == "-":
+        return "-"
+    parts = host.lower().split('.')
+    known = ['google', 'github', 'microsoft', 'amazon', 'facebook', 'youtube', 'cloudflare']
+    for part in parts:
+        if part in known:
+            return part.capitalize()
+    return parts[0].capitalize()
 
-def is_private_ip(ip):
-    return ip.startswith("192.") or ip.startswith("10.") or ip.startswith("172.")
-
-def build_table():
-    table = Table(title="🔍 Live Network Monitor", expand=True)
+def build_table(connections_dict, label):
+    table = Table(title=f"{label} Traffic", expand=True)
     table.add_column("Count", justify="right")
-    table.add_column("Direction", justify="center")
-    table.add_column("Source", style="cyan")
-    table.add_column("→", justify="center")
-    table.add_column("Destination", style="magenta")
-    table.add_column("Bytes", justify="right")
-    table.add_column("Host", style="green")
+    table.add_column("Src")
+    table.add_column("→")
+    table.add_column("Dst")
+    table.add_column("Size", justify="right")
+    table.add_column("Host")
+    table.add_column("Proposed")
+    table.add_column("Country")
 
-    for conn, count in seen_connections.items():
-        src_ip, dst_ip, src_port, dst_port, direction, host, length = conn
-        src = f"{src_ip}:{src_port}"
-        dst = f"{dst_ip}:{dst_port}"
-        table.add_row(str(count), direction, src, "→", dst, str(length), host)
+    for conn, count in list(connections_dict.items())[-25:]:
+        src, dst, length, sport, dport = conn
+        target_ip = dst if label == "OUT" else src
+        host = resolve_hostname(target_ip)
+        country = get_country_flag(target_ip)
+        proposed = propose_host_name(host)
+        highlight = Text(proposed, style="bold red") if is_suspicious_domain(proposed) else Text(proposed, style="green")
+
+        table.add_row(str(count), f"{src}:{sport}", "→", f"{dst}:{dport}", str(length), host, highlight, country)
 
     return table
 
-def process_packet(packet):
-    if IP in packet:
-        ip_layer = packet[IP]
+def packet_callback(pkt):
+    if IP in pkt:
+        ip_layer = pkt[IP]
         src_ip = ip_layer.src
         dst_ip = ip_layer.dst
-        src_port = packet.sport if TCP in packet or UDP in packet else 'N/A'
-        dst_port = packet.dport if TCP in packet or UDP in packet else 'N/A'
-        length = len(packet)
+        sport = pkt.sport if hasattr(pkt, 'sport') else 0
+        dport = pkt.dport if hasattr(pkt, 'dport') else 0
+        length = len(pkt)
 
-        direction = "OUT" if is_private_ip(src_ip) else "IN"
-        remote_ip = dst_ip if direction == "OUT" else src_ip
-        remote_host = resolve_hostname(remote_ip)
+        key = (src_ip, dst_ip, length, sport, dport)
+        if src_ip in all_local_ips:
+            seen_out_connections[key] += 1
+        else:
+            seen_in_connections[key] += 1
 
-        conn_key = (src_ip, dst_ip, src_port, dst_port, direction, remote_host, length)
-        seen_connections[conn_key] += 1
-
-def handle_exit(sig, frame):
-    console.print("\n[bold red]🛑 Stopping packet monitor.[/bold red]")
-    sys.exit(0)
-
-def main():
-    signal.signal(signal.SIGINT, handle_exit)
-
-    parser = argparse.ArgumentParser(description="Network Traffic Monitor with Hostnames")
-    parser.add_argument('--filter', help='BPF filter (e.g., \"tcp\", \"udp\")', default="")
-    args = parser.parse_args()
-
-    console.print("[bold yellow]Starting network monitor... Press Ctrl+C to stop[/bold yellow]")
-
-    with Live(build_table(), refresh_per_second=2, screen=True) as live:
-        def wrapped(packet):
-            process_packet(packet)
-            live.update(build_table())
-
-        sniff(prn=wrapped, store=0, filter=args.filter)
+def sniff_packets():
+    sniff(prn=packet_callback, store=False)
 
 if __name__ == "__main__":
-    main()
+    sniff_thread = threading.Thread(target=sniff_packets, daemon=True)
+    sniff_thread.start()
+
+    with Live(refresh_per_second=2, screen=True) as live:
+        while True:
+            try:
+                table_in = build_table(seen_in_connections, "IN")
+                table_out = build_table(seen_out_connections, "OUT")
+                combined = Group(table_in, table_out)
+                live.update(combined)
+                time.sleep(1)
+            except KeyboardInterrupt:
+                break
