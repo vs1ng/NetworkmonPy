@@ -1,6 +1,16 @@
+#!/usr/bin/env python3
 from scapy.all import sniff, IP, TCP, UDP
 import socket
+from rich.live import Live
+from rich.table import Table
+from rich.console import Console
+from collections import defaultdict
 import argparse
+import signal
+import sys
+
+console = Console()
+seen_connections = defaultdict(int)  # (src_ip, dst_ip, src_port, dst_port, direction) -> count
 
 def resolve_hostname(ip):
     try:
@@ -10,6 +20,24 @@ def resolve_hostname(ip):
 
 def is_private_ip(ip):
     return ip.startswith("192.") or ip.startswith("10.") or ip.startswith("172.")
+
+def build_table():
+    table = Table(title="🔍 Live Network Monitor", expand=True)
+    table.add_column("Count", justify="right")
+    table.add_column("Direction", justify="center")
+    table.add_column("Source", style="cyan")
+    table.add_column("→", justify="center")
+    table.add_column("Destination", style="magenta")
+    table.add_column("Bytes", justify="right")
+    table.add_column("Host", style="green")
+
+    for conn, count in seen_connections.items():
+        src_ip, dst_ip, src_port, dst_port, length, direction, host = conn
+        src = f"{src_ip}:{src_port}"
+        dst = f"{dst_ip}:{dst_port}"
+        table.add_row(str(count), direction, src, "→", dst, str(length), host)
+
+    return table
 
 def process_packet(packet):
     if IP in packet:
@@ -21,24 +49,31 @@ def process_packet(packet):
         length = len(packet)
 
         direction = "OUT" if is_private_ip(src_ip) else "IN"
-
         remote_ip = dst_ip if direction == "OUT" else src_ip
         remote_host = resolve_hostname(remote_ip)
 
-        print(f"[{direction}] {src_ip}:{src_port} → {dst_ip}:{dst_port} | {length} bytes | Host: {remote_host} ({remote_ip})")
+        conn_key = (src_ip, dst_ip, src_port, dst_port, length, direction, remote_host)
+        seen_connections[conn_key] += 1
+
+def handle_exit(sig, frame):
+    console.print("\n[bold red]🛑 Stopping packet monitor.[/bold red]")
+    sys.exit(0)
 
 def main():
-    parser = argparse.ArgumentParser(description="Network Traffic Monitor - CLI")
-    parser.add_argument('--filter', help='BPF filter (e.g., "tcp", "udp", "port 80")', default="")
+    signal.signal(signal.SIGINT, handle_exit)
+
+    parser = argparse.ArgumentParser(description="Network Traffic Monitor with Table")
+    parser.add_argument('--filter', help='BPF filter (e.g., "tcp", "udp")', default="")
     args = parser.parse_args()
 
-    print("🔍 Monitoring network traffic... (Ctrl+C to stop)\n")
-    try:
-        sniff(prn=process_packet, store=0, filter=args.filter)
-    except PermissionError:
-        print("❌ You need to run this script with sudo/root privileges.")
-    except KeyboardInterrupt:
-        print("\n🛑 Monitoring stopped.")
+    console.print("[bold yellow]Starting network monitor... Press Ctrl+C to stop[/bold yellow]")
+
+    with Live(build_table(), refresh_per_second=2, screen=True) as live:
+        def wrapped(packet):
+            process_packet(packet)
+            live.update(build_table())
+
+        sniff(prn=wrapped, store=0, filter=args.filter)
 
 if __name__ == "__main__":
     main()
